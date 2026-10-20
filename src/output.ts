@@ -6,6 +6,7 @@ import {
 	styledCharsToString,
 	tokenize,
 } from '@alcalzone/ansi-tokenize';
+import measureText from './measure-text.js';
 import {type OutputTransformer} from './render-node-to-output.js';
 
 // Replaces a partially visible wide character with a space that keeps its styles.
@@ -86,19 +87,25 @@ const intersectClips = (outer: Clip | undefined, inner: Clip): Clip => {
 	};
 };
 
+const parseStyledChars = (line: string): StyledChar[] =>
+	styledCharsFromTokens(tokenize(line)).filter(
+		character => !/^\p{Default_Ignorable_Code_Point}+$/u.test(character.value),
+	);
+
 export class OutputCaches {
 	readonly widths = new QuickLRU<string, number>({maxSize: 4096});
-	readonly blockWidths = new QuickLRU<string, number>({maxSize: 512});
 	readonly styledChars = new QuickLRU<string, StyledChar[]>({maxSize: 512});
 
 	getStyledChars(line: string): StyledChar[] {
+		// Persist parsed characters for individual lines and leave whole multiline blocks uncached
+		// to avoid retaining hundreds of full screen revisions in the cache.
+		if (line.includes('\n')) {
+			return parseStyledChars(line);
+		}
+
 		let cached = this.styledChars.get(line);
 		if (cached === undefined) {
-			// Standalone invisible Unicode characters must not occupy terminal cells.
-			cached = styledCharsFromTokens(tokenize(line)).filter(
-				character =>
-					!/^\p{Default_Ignorable_Code_Point}+$/u.test(character.value),
-			);
+			cached = parseStyledChars(line);
 			this.styledChars.set(line, cached);
 		}
 
@@ -116,23 +123,11 @@ export class OutputCaches {
 	}
 
 	getWidestLine(text: string): number {
-		let cached = this.blockWidths.get(text);
-		if (cached === undefined) {
-			let lineWidth = 0;
-			for (const line of text.split('\n')) {
-				lineWidth = Math.max(lineWidth, this.getStringWidth(line));
-			}
-
-			cached = lineWidth;
-			this.blockWidths.set(text, cached);
-		}
-
-		return cached;
+		return measureText(text).width;
 	}
 
 	clear(): void {
 		this.widths.clear();
-		this.blockWidths.clear();
 		this.styledChars.clear();
 	}
 }

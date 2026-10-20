@@ -1,5 +1,6 @@
 import test, {type TestContext} from 'node:test';
 import React from 'react';
+import chalk from 'chalk';
 import Output, {OutputCaches, outputCaches} from '../src/output.js';
 import {Box, Text, renderToString} from '../src/index.js';
 
@@ -21,28 +22,17 @@ test('OutputCaches caches line widths and evicts oldest after maxSize (4096)', (
 	t.assert.strictEqual(caches.widths.has('test-string-first'), false);
 });
 
-test('OutputCaches caches block widths and evicts oldest after maxSize (512)', (t: TestContext) => {
+test('OutputCaches getWidestLine delegates to measureText and returns block width', (t: TestContext) => {
 	const caches = new OutputCaches();
 
 	const firstWidth = caches.getWidestLine('hello\nworld!');
 	t.assert.strictEqual(firstWidth, 6);
-	t.assert.strictEqual(caches.blockWidths.has('hello\nworld!'), true);
-	// Line widths are also populated in `widths`
-	t.assert.strictEqual(caches.widths.has('hello'), true);
-	t.assert.strictEqual(caches.widths.has('world!'), true);
 
-	// Repeated call returns cached value
+	// Repeated call returns cached value from measureText
 	t.assert.strictEqual(caches.getWidestLine('hello\nworld!'), 6);
-
-	// Insert entries to trigger eviction (2 * maxSize = 1024)
-	for (let index = 0; index < 1024; index++) {
-		caches.getWidestLine(`block-${index}\nline2`);
-	}
-
-	t.assert.strictEqual(caches.blockWidths.has('hello\nworld!'), false);
 });
 
-test('OutputCaches caches styled characters and evicts oldest after maxSize (512)', (t: TestContext) => {
+test('OutputCaches caches styled characters for single lines and evicts oldest after maxSize (512)', (t: TestContext) => {
 	const caches = new OutputCaches();
 
 	const firstChars = caches.getStyledChars('styled-line-first');
@@ -60,21 +50,32 @@ test('OutputCaches caches styled characters and evicts oldest after maxSize (512
 	t.assert.strictEqual(caches.styledChars.has('styled-line-first'), false);
 });
 
-test('OutputCaches clear() resets all three caches', (t: TestContext) => {
+test('OutputCaches does not cache whole multiline blocks in styledChars to prevent heap blowup', (t: TestContext) => {
+	const caches = new OutputCaches();
+	const multiline = 'line one\nline two\nline three';
+
+	const parsed = caches.getStyledChars(multiline);
+	// Parsed tokens contain the newlines
+	t.assert.strictEqual(
+		parsed.some(char => char.value === '\n'),
+		true,
+	);
+	// Whole multiline block must NOT be stored in styledChars
+	t.assert.strictEqual(caches.styledChars.has(multiline), false);
+});
+
+test('OutputCaches clear() resets caches', (t: TestContext) => {
 	const caches = new OutputCaches();
 
 	caches.getStringWidth('line');
-	caches.getWidestLine('block');
 	caches.getStyledChars('styled');
 
 	t.assert.strictEqual(caches.widths.size > 0, true);
-	t.assert.strictEqual(caches.blockWidths.size > 0, true);
 	t.assert.strictEqual(caches.styledChars.size > 0, true);
 
 	caches.clear();
 
 	t.assert.strictEqual(caches.widths.size, 0);
-	t.assert.strictEqual(caches.blockWidths.size, 0);
 	t.assert.strictEqual(caches.styledChars.size, 0);
 });
 
@@ -147,22 +148,60 @@ test('horizontal clipping in Output write operations uses fast path for fitting 
 	t.assert.strictEqual(lines[1], '  23456789');
 });
 
-test('render-node-to-output routes widestLine through shared cache', (t: TestContext) => {
-	outputCaches.clear();
-
+test('render-node-to-output routes widestLine through measureText', (t: TestContext) => {
 	const text = 'line one\nlonger line two\nline three';
-	renderToString(
+	const rendered = renderToString(
 		<Box width={30}>
 			<Text>{text}</Text>
 		</Box>,
 	);
 
-	// Block width should be cached in outputCaches
-	t.assert.strictEqual(outputCaches.blockWidths.has(text), true);
-	t.assert.strictEqual(outputCaches.blockWidths.get(text), 15);
+	t.assert.strictEqual(rendered, text);
+});
 
-	// Each individual line width should also be cached
-	t.assert.strictEqual(outputCaches.widths.has('line one'), true);
-	t.assert.strictEqual(outputCaches.widths.has('longer line two'), true);
-	t.assert.strictEqual(outputCaches.widths.has('line three'), true);
+test('regression: multiline updates with changing status row cache per-line without retaining multiline blocks', (t: TestContext) => {
+	outputCaches.clear();
+
+	const stableRow1 = 'stable row 1: static content';
+	const stableRow2 = 'stable row 2: another static row';
+
+	for (let frame = 0; frame < 5; frame++) {
+		const statusRow = `status at frame ${frame}`;
+		const fullBlock = `${stableRow1}\n${stableRow2}\n${statusRow}`;
+
+		const output = new Output({width: 40, height: 3});
+		output.write(0, 0, fullBlock, {transformers: []});
+		const result = output.get();
+
+		t.assert.strictEqual(
+			result.output,
+			`${stableRow1}\n${stableRow2}\n${statusRow}`,
+		);
+
+		// The whole multiline block should NOT be in styledChars
+		t.assert.strictEqual(outputCaches.styledChars.has(fullBlock), false);
+	}
+
+	// Stable individual rows MUST be cached in styledChars
+	t.assert.strictEqual(outputCaches.styledChars.has(stableRow1), true);
+	t.assert.strictEqual(outputCaches.styledChars.has(stableRow2), true);
+});
+
+test('styles spanning newlines in multiline blocks still work correctly across frames', (t: TestContext) => {
+	const originalLevel = chalk.level;
+	chalk.level = 3;
+	t.after(() => {
+		chalk.level = originalLevel;
+	});
+
+	// Text with ANSI red opened on line 1 and closed on line 2
+	const redMultiline = chalk.red('line 1\nline 2');
+
+	const output1 = renderToString(<Text>{redMultiline}</Text>);
+	const expected = `${chalk.red('line 1')}\n${chalk.red('line 2')}`;
+	t.assert.strictEqual(output1, expected);
+
+	// Second render reuses individual lines and produces identical output
+	const output2 = renderToString(<Text>{redMultiline}</Text>);
+	t.assert.strictEqual(output2, expected);
 });
