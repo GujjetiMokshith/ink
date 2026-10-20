@@ -1,3 +1,4 @@
+import QuickLRU from 'quick-lru';
 import stringWidth from 'string-width';
 import {
 	type StyledChar,
@@ -25,6 +26,7 @@ Used to generate the final output of all nodes before writing it to actual outpu
 type Options = {
 	width: number;
 	height: number;
+	caches?: OutputCaches;
 };
 
 type Operation = WriteOperation | ClipOperation | UnclipOperation;
@@ -84,10 +86,10 @@ const intersectClips = (outer: Clip | undefined, inner: Clip): Clip => {
 	};
 };
 
-class OutputCaches {
-	widths = new Map<string, number>();
-	blockWidths = new Map<string, number>();
-	styledChars = new Map<string, StyledChar[]>();
+export class OutputCaches {
+	readonly widths = new QuickLRU<string, number>({maxSize: 4096});
+	readonly blockWidths = new QuickLRU<string, number>({maxSize: 512});
+	readonly styledChars = new QuickLRU<string, StyledChar[]>({maxSize: 512});
 
 	getStyledChars(line: string): StyledChar[] {
 		let cached = this.styledChars.get(line);
@@ -127,20 +129,29 @@ class OutputCaches {
 
 		return cached;
 	}
+
+	clear(): void {
+		this.widths.clear();
+		this.blockWidths.clear();
+		this.styledChars.clear();
+	}
 }
+
+export const outputCaches = new OutputCaches();
 
 export default class Output {
 	private readonly operations: Operation[] = [];
-	private readonly caches: OutputCaches = new OutputCaches();
+	readonly caches: OutputCaches;
 
 	width: number;
 	height: number;
 
 	constructor(options: Options) {
-		const {width, height} = options;
+		const {width, height, caches = outputCaches} = options;
 
 		this.width = width;
 		this.height = height;
+		this.caches = caches;
 	}
 
 	private applyWriteOperation(
@@ -198,7 +209,9 @@ export default class Output {
 					const width = this.caches.getStringWidth(line);
 					const to = x + width > clip.x2! ? clip.x2! - x : width;
 
-					return this.sliceLineToColumns(line, from, to);
+					return from === 0 && to >= width
+						? line
+						: this.sliceLineToColumns(line, from, to);
 				});
 
 				if (x < clip.x1!) {
@@ -323,6 +336,10 @@ export default class Output {
 	sliceLineToColumns(line: string, from: number, to: number): string {
 		if (from >= to) {
 			return '';
+		}
+
+		if (from <= 0 && to >= this.caches.getStringWidth(line)) {
+			return line;
 		}
 
 		const result: StyledChar[] = [];
