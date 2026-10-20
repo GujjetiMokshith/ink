@@ -205,3 +205,60 @@ test('styles spanning newlines in multiline blocks still work correctly across f
 	const output2 = renderToString(<Text>{redMultiline}</Text>);
 	t.assert.strictEqual(output2, expected);
 });
+
+test('styled multiline text with links, emoji and clipping renders identically across frames', (t: TestContext) => {
+	const originalLevel = chalk.level;
+	chalk.level = 3;
+	t.after(() => {
+		chalk.level = originalLevel;
+	});
+
+	const content = [
+		chalk.blue('🚀 Header with rocket emoji'),
+		'\u{1B}]8;;https://example.com\u{7}🔗 Link row in dashboard\u{1B}]8;;\u{7}',
+		chalk.green('✔ Status: operational'),
+	].join('\n');
+
+	// Render with clipping (Box overflow="hidden")
+	const renderFrame = () =>
+		renderToString(
+			<Box width={25} height={3} overflow="hidden">
+				<Text>{content}</Text>
+			</Box>,
+		);
+
+	const frame1 = renderFrame();
+	const frame2 = renderFrame();
+
+	t.assert.strictEqual(frame1, frame2);
+});
+
+test('regression: 120x40 dashboard with 39 stable rows and 1 changing status row inside single multiline Text', (t: TestContext) => {
+	outputCaches.clear();
+
+	const stableRows = Array.from(
+		{length: 39},
+		(_, index) =>
+			`Row ${index.toString().padStart(2, '0')}: stable content across frames`,
+	);
+
+	for (let frame = 0; frame < 5; frame++) {
+		const statusRow = `Row 39: dynamic status ticker ${frame}`;
+		const screen = [...stableRows, statusRow].join('\n');
+
+		const rendered = renderToString(
+			<Box width={120} height={40}>
+				<Text>{screen}</Text>
+			</Box>,
+		);
+
+		t.assert.strictEqual(rendered, screen);
+		// Ensure full screen block is not cached in styledChars
+		t.assert.strictEqual(outputCaches.styledChars.has(screen), false);
+	}
+
+	// Verify all 39 stable rows are cached
+	for (const row of stableRows) {
+		t.assert.strictEqual(outputCaches.styledChars.has(row), true);
+	}
+});
